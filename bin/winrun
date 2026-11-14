@@ -10,6 +10,8 @@
 #   --list         list every game winrun has seen
 #   --kill         stop everything running in that game's prefix
 #   --winecfg      open winecfg inside that game's prefix
+#   --desktop [WxH]  run inside a Wine virtual desktop window (fixes games whose
+#                  window maps but never appears under Wayland/mutter)
 #   --dry-run      print what would run, run nothing
 #   -h, --help
 #
@@ -30,6 +32,9 @@ WL_DLLOVERRIDES_EXTRA="${WL_DLLOVERRIDES_EXTRA:-}"
 WL_LOCALE="${WL_LOCALE:-}"                  # e.g. ja_JP.UTF-8 for Shift-JIS engines
 WL_STARTUP_SECS="${WL_STARTUP_SECS:-20}"    # exits faster than this count as startup failures
 WL_EXTRA_ARGS=()                            # extra args appended to the game command line
+WL_VIRTUALDESK="${WL_VIRTUALDESK:-0}"       # 1 = run inside a Wine virtual desktop window
+WL_VIRTUALDESK_SIZE="${WL_VIRTUALDESK_SIZE:-1920x1080}"
+WL_FOCUS="${WL_FOCUS:-}"                    # focus helper; default bin/wl-focus next to winrun
 
 GUI=0; MODE=run; GAME_ID=""; EXE=""
 
@@ -98,6 +103,11 @@ while [ $# -gt 0 ]; do
         --kill) MODE='kill' ;;
         --winecfg) MODE=winecfg ;;
         --dry-run) MODE=dryrun ;;
+        --desktop)
+            WL_VIRTUALDESK=1
+            case "${2:-}" in
+                [0-9]*x[0-9]*) WL_VIRTUALDESK_SIZE="$2"; shift ;;
+            esac ;;
         --id) shift; GAME_ID="${1:-}" ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
@@ -172,6 +182,11 @@ if [ "$MODE" = info ] || [ "$MODE" = dryrun ]; then
         "$ID" "$EXE" "$ARCH" "$GAME_DIR" "$PREFIX" \
         "$([ -f "$PREFIX/.winlauncher-ready" ] && echo ready || echo 'not created yet')" \
         "$LOG" "$WL_CONF/games/$ID.conf" "$OVERRIDES"
+    if [ "$WL_VIRTUALDESK" = 1 ]; then
+        printf 'mode      virtual desktop wl-%s %s (keyboard focus grabbed after start)\n' "$ID" "$WL_VIRTUALDESK_SIZE"
+    else
+        printf 'mode      normal\n'
+    fi
     if [ "$MODE" = dryrun ]; then
         extra=""; for a in "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}"; do extra+=" $(printf '%q' "$a")"; done
         printf 'would run: cd %q && WINEPREFIX=%q WINEDLLOVERRIDES=%q %q %q%s\n' \
@@ -234,7 +249,30 @@ fi
 
 cd "$GAME_DIR" || die "cannot enter game folder: $GAME_DIR"
 start=$(date +%s)
-WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1
+if [ "$WL_VIRTUALDESK" = 1 ]; then
+    # Some Wine windows map as viewable but are never raised/composited by the desktop
+    # (seen under mutter/Wayland): the game runs invisibly behind other windows.
+    # A Wine virtual desktop gives the game one ordinary, raiseable top-level window.
+    EXE_WIN=$("$WL_WINE" winepath -w "$EXE" 2>/dev/null | tr -d '\r')
+    [ -n "$EXE_WIN" ] || EXE_WIN="$EXE"
+    printf 'mode     virtual desktop wl-%s %s\n' "$ID" "$WL_VIRTUALDESK_SIZE" >>"$LOG"
+    WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" explorer "/desktop=wl-$ID,$WL_VIRTUALDESK_SIZE" \
+        "$EXE_WIN" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1 &
+    wine_pid=$!
+    # Keyboard focus: a mapped Wine window can still not be the active window, so
+    # WASD/arrows go nowhere and the game looks frozen. Grab focus once it appears.
+    # wl-focus exits 0 = focused, 1 = window not there yet (retry), 3 = can't apply
+    # here (no X display / x11-utils missing): stop trying, the game still runs.
+    [ -n "$WL_FOCUS" ] || WL_FOCUS="$(dirname "$(readlink -f "$0")")/wl-focus"
+    for _ in $(seq 1 24); do
+        sleep 0.5
+        "$WL_FOCUS" "wl-$ID" >>"$LOG" 2>&1
+        case $? in 0|3) break ;; esac
+    done
+    wait "$wine_pid"
+else
+    WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1
+fi
 rc=$?
 # Launchers often exit while the real game keeps running; wait for the whole prefix.
 [ -n "$WINESERVER" ] && "$WINESERVER" -w 2>/dev/null

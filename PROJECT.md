@@ -28,7 +28,7 @@ double-click, and read them in English using a translation server they run thems
 ## Map
 | Role | Path |
 |---|---|
-| Launcher | `bin/winrun` |
+| Launcher | `bin/winrun`, `bin/wl-focus` (keyboard focus for `--desktop`) |
 | Translation installer | `bin/wl-translate` |
 | Inventory | `bin/wl-scan`, `lib/wlcommon.py` |
 | Menu entries | `bin/wl-desktop` |

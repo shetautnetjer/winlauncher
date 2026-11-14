@@ -17,6 +17,7 @@ mkdir -p "$HOME" "$T/fake"
 cat > "$T/fake/wine" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then echo wine-fake; exit 0; fi
+if [ "${1:-}" = "winepath" ]; then echo 'Z:\fake\Game.exe'; exit 0; fi
 if [ "${1:-}" = "wineboot" ]; then mkdir -p "$WINEPREFIX"; : > "$WINEPREFIX/system.reg"; echo boot >> "$FAKE_LOG.boot"; exit 0; fi
 { printf 'CWD=%s\n' "$PWD"; printf 'PREFIX=%s\n' "$WINEPREFIX"; printf 'OVR=%s\n' "$WINEDLLOVERRIDES"
   printf 'ARCH=%s\n' "$WINEARCH"; for a in "$@"; do printf 'ARG=%s\n' "$a"; done; } > "$FAKE_LOG"
@@ -95,6 +96,22 @@ mkdir -p "$WL_CONF/games"; printf 'WL_DLLOVERRIDES_EXTRA="d3d11=n"\nWL_EXTRA_ARG
 "$REPO/bin/winrun" "$OTHER/Game.exe" >/dev/null 2>&1
 check "per-game overrides appended" 'grep -q "^OVR=winhttp=n,b;winemenubuilder.exe=d;d3d11=n$" "$FAKE_LOG"'
 check "per-game extra args" 'grep -qx "ARG=-screen-fullscreen" "$FAKE_LOG"'
+
+# ---- 7b. --desktop: virtual desktop + keyboard focus grab
+printf '#!/bin/sh\necho "$1" >> "%s"\nexit 0\n' "$T/focus.log" > "$T/fake/focus"
+printf '#!/bin/sh\nexit 3\n' > "$T/fake/nofocus"
+chmod +x "$T/fake/focus" "$T/fake/nofocus"
+WL_FOCUS="$T/fake/focus" "$REPO/bin/winrun" --desktop 1280x720 "$OTHER/Game.exe" >/dev/null 2>&1; rc=$?
+check "--desktop exits 0" '[ $rc = 0 ]'
+check "--desktop runs explorer /desktop=wl-<id>,WxH" 'grep -qx "ARG=explorer" "$FAKE_LOG" && grep -qxF "ARG=/desktop=wl-$ID2,1280x720" "$FAKE_LOG"'
+check "--desktop passes the Windows path of the exe" 'grep -qxF "ARG=Z:\\fake\\Game.exe" "$FAKE_LOG"'
+check "--desktop grabs focus for wl-<id>" 'grep -qx "wl-$ID2" "$T/focus.log"'
+WL_FOCUS="$T/fake/nofocus" "$REPO/bin/winrun" --desktop "$OTHER/Game.exe" >/dev/null 2>&1; rc=$?
+check "focus not possible: no retry storm, game still runs" '[ $rc = 0 ] && grep -qxF "ARG=/desktop=wl-$ID2,1920x1080" "$FAKE_LOG"'
+"$REPO/bin/winrun" --info --desktop "$OTHER/Game.exe" > "$T/info" 2>&1
+check "--info shows desktop mode" 'grep -q "^mode      virtual desktop" "$T/info"'
+env -u DISPLAY python3 "$REPO/bin/wl-focus" x >/dev/null 2>&1; rc=$?
+check "wl-focus without a display exits 3 (skip)" '[ $rc = 3 ]'
 
 # ---- 8. mimeapps set/restore round trip
 mkdir -p "$XDG_CONFIG_HOME"

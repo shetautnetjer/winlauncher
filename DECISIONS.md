@@ -33,3 +33,21 @@
 ## 2026-11-14T09:53Z: Published
 - Maintainer chose: public repository github.com/shetautnetjer/winlauncher, MIT
   license (supersedes "pending maintainer confirmation" above).
+
+## 2026-11-14T11:05Z: Wayland visibility and keyboard focus (--desktop)
+- Observed on GNOME/Wayland: a Wine game window can map, report itself visible and
+  render, yet never be raised/composited, and never become the focused window, so
+  keystrokes go elsewhere. Evidence: focused window was an unrelated one; after the
+  fix one synthetic Down arrow changed ~17% of the screen and Up ~4% (menu moved).
+- Fix: `--desktop` (or WL_VIRTUALDESK=1 per game) runs the game inside a Wine virtual
+  desktop window named wl-<id>; winrun polls up to ~12 s and calls bin/wl-focus,
+  which raises it, sends _NET_ACTIVE_WINDOW and calls XSetInputFocus directly
+  (mutter often ignores the polite request). Pure Python ctypes + xwininfo.
+- Off by default: only enabled per game where the problem was seen (2 titles on the
+  original machine). Correction to the agent report that "a plain double-click no
+  longer swallows input": true only for games with WL_VIRTUALDESK=1.
+- wl-focus exits 3 when it cannot apply (no DISPLAY, no xwininfo, no libX11) and
+  winrun stops retrying; previously it raised and retried 24 times.
+- The test helpers dl-sweep.sh (real library paths) and keyprobe.py (needs Pillow;
+  deleted ~/Pictures/Screenshot.png before each capture, now parks and restores it)
+  are lab tools, kept outside the repo.

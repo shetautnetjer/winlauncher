@@ -19,7 +19,8 @@ game files, no translations and no third-party binaries.
   KDE/Dolphin should work the same way).
 - Wine (tested with Wine 10.0, WoW64 build). Proton/Steam are not used.
 - `python3`, `xdg-utils`, `util-linux` (`flock`), `coreutils`. Optional: `zenity`
-  for error dialogs, `xvfb-run` for headless testing.
+  for error dialogs, `x11-utils` for `--desktop` focus handling, `xvfb-run` for
+  headless testing.
 
 ## Install
 
@@ -68,6 +69,7 @@ winrun --dry-run "/path/to/Game.exe"
 winrun --list                       # every game seen, with its last result
 winrun --kill --id <id>             # stop a stuck game
 winrun --winecfg --id <id>          # winecfg for that game's prefix
+winrun --desktop [WxH] "/path/to/Game.exe"   # run inside a Wine virtual desktop window
 ```
 
 - **One prefix per game:** `~/.local/share/winlauncher/prefixes/<id>`, where
@@ -88,6 +90,13 @@ winrun --winecfg --id <id>          # winecfg for that game's prefix
   dialog with the exit code, the last `err:` lines and the log path. winrun waits for
   the whole prefix, so launchers that hand off to the real game are timed correctly.
 - **One instance per game.** A second double-click says it's already running.
+- **Invisible window, or keyboard does nothing?** On some Wayland desktops a Wine
+  window maps and renders but is never shown on top, or never gets keyboard focus, so
+  WASD/arrows go to another window. `--desktop` runs the game inside one ordinary
+  Wine virtual-desktop window, then raises it and gives it keyboard focus as soon as
+  it appears (up to ~12 s). To make that the default for one game, put
+  `WL_VIRTUALDESK=1` in its config (below). Focus handling needs `x11-utils`; without
+  it, or without an X display, it is skipped and the game still runs.
 - **Per-game settings** in `~/.config/winlauncher/games/<id>.conf` (bash):
 
   ```bash
@@ -95,6 +104,8 @@ winrun --winecfg --id <id>          # winecfg for that game's prefix
   WL_DLLOVERRIDES_EXTRA="d3d11=n"  # appended to the default overrides
   WL_EXTRA_ARGS=(-screen-fullscreen 0)
   WL_STARTUP_SECS=40
+  WL_VIRTUALDESK=1                 # always use --desktop for this game
+  WL_VIRTUALDESK_SIZE=1280x720
   ```
 
 ## In-game English
@@ -177,9 +188,10 @@ prefix ids. `WL_LIBRARY` sets the default folder.
 
 ## Tests
 
-- `tests/run-tests.sh`: 52 offline checks with a fake Wine. They cover awkward paths
+- `tests/run-tests.sh`: 59 offline checks with a fake Wine. They cover awkward paths
   (spaces, brackets, Japanese, quotes, `$`), working directory, prefix ids and
-  isolation, crash reporting, the single-instance lock, `mimeapps.list` set/restore
+  isolation, crash reporting, the single-instance lock, `--desktop` mode and focus
+  fallback, `mimeapps.list` set/restore
   byte-for-byte, and `wl-translate` dry run / apply / re-apply / byte-for-byte
   uninstall / existing-install protection / BOM configs / cloud-endpoint correction.
   Runs in CI.
