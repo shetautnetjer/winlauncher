@@ -1,0 +1,7 @@
+# generated from your own game library — never publish
+status/
+LOCAL-NOTES.md
+# downloaded third-party packages (BepInEx, XUnity) — not redistributed here
+pkgs/
+*.zip
+__pycache__/

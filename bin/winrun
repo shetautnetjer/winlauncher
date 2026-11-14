@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# winrun — launch a Windows .exe under system Wine, one isolated prefix per game.
+#
+#   winrun [options] <game.exe> [game args...]
+#   winrun [options] --id <ID> [game args...]   # re-launch a game by its id
+#
+# Options:
+#   --gui          report errors with a dialog/notification (used by double-click)
+#   --info         print id, prefix, log paths for the exe and exit
+#   --list         list every game winrun has seen
+#   --kill         stop everything running in that game's prefix
+#   --winecfg      open winecfg inside that game's prefix
+#   --dry-run      print what would run, run nothing
+#   -h, --help
+#
+# The prefix id is the first 16 hex chars of sha256(<absolute folder of the exe>).
+# Nothing is ever written into the game folder by this script.
+
+set -u
+
+WL_DATA="${WL_DATA:-$HOME/.local/share/winlauncher}"     # prefixes live here
+WL_STATE="${WL_STATE:-$HOME/.local/state/winlauncher}"   # logs + per-game records
+WL_CONF="${WL_CONF:-$HOME/.config/winlauncher}"          # optional user overrides
+
+# Defaults; may be changed in $WL_CONF/winlauncher.conf or $WL_CONF/games/<ID>.conf
+WL_WINE="${WL_WINE:-wine}"
+WL_WINESERVER="${WL_WINESERVER:-}"
+WL_WINEDEBUG="${WL_WINEDEBUG:-fixme-all}"   # keeps err: lines for crash reports
+WL_DLLOVERRIDES_EXTRA="${WL_DLLOVERRIDES_EXTRA:-}"
+WL_LOCALE="${WL_LOCALE:-}"                  # e.g. ja_JP.UTF-8 for Shift-JIS engines
+WL_STARTUP_SECS="${WL_STARTUP_SECS:-20}"    # exits faster than this count as startup failures
+WL_EXTRA_ARGS=()                            # extra args appended to the game command line
+
+GUI=0; MODE=run; GAME_ID=""; EXE=""
+
+die() {
+    local msg="$1"
+    printf 'winrun: %s\n' "$msg" >&2
+    if [ "$GUI" = 1 ]; then gui_error "$msg"; fi
+    exit "${2:-1}"
+}
+
+gui_error() {
+    # zenity dialog, then notify-send, then nothing (stderr already has it)
+    local msg="$1"
+    if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        zenity --error --title="winrun" --width=560 --no-markup --text="$msg" >/dev/null 2>&1 && return
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a winrun -u critical "winrun" "$msg" >/dev/null 2>&1 || true
+    fi
+}
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+
+find_wineserver() {
+    [ -n "$WL_WINESERVER" ] && { printf '%s\n' "$WL_WINESERVER"; return; }
+    local c
+    for c in "$(command -v wineserver 2>/dev/null)" \
+             /usr/lib/x86_64-linux-gnu/wine/wineserver /usr/lib/wine/wineserver \
+             /usr/lib64/wine/wineserver /opt/wine-stable/bin/wineserver; do
+        [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return; }
+    done
+    return 1
+}
+
+game_id_for_dir() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+
+ensure_utf8_locale() {
+    # Wine converts Unix filenames with the current locale; a C/POSIX locale breaks
+    # CJK paths. Force a UTF-8 locale unless one is already active.
+    if [ -n "$WL_LOCALE" ]; then
+        export LANG="$WL_LOCALE" LC_ALL="$WL_LOCALE"
+        return
+    fi
+    case "$(locale charmap 2>/dev/null)" in
+        UTF-8|utf8) ;;
+        *) export LC_ALL=C.UTF-8 LANG=C.UTF-8 ;;
+    esac
+}
+
+pe_arch() {
+    # prints x64, x86, or "?"; pure bash+od, no python needed
+    local f="$1" off mach
+    [ "$(head -c2 -- "$f" 2>/dev/null)" = "MZ" ] || { echo "not-pe"; return; }
+    off=$(od -An -tu4 -j60 -N4 -- "$f" 2>/dev/null | tr -d ' ')
+    [ -n "$off" ] || { echo "?"; return; }
+    mach=$(od -An -tx2 -j$((off + 4)) -N2 -- "$f" 2>/dev/null | tr -d ' ')
+    case "$mach" in 8664) echo x64 ;; 014c) echo x86 ;; aa64) echo arm64 ;; *) echo "?" ;; esac
+}
+
+# ---------------------------------------------------------------- arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gui) GUI=1 ;;
+        --info) MODE=info ;;
+        --list) MODE=list ;;
+        --kill) MODE='kill' ;;
+        --winecfg) MODE=winecfg ;;
+        --dry-run) MODE=dryrun ;;
+        --id) shift; GAME_ID="${1:-}" ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1 (see winrun --help)" 2 ;;
+        *) break ;;
+    esac
+    shift
+done
+
+if [ "$MODE" = list ]; then
+    for d in "$WL_STATE"/games/*/; do
+        [ -f "$d/exe" ] || continue
+        id=$(basename "$d"); exe=$(cat "$d/exe")
+        last=$(tail -n1 "$d/runs.tsv" 2>/dev/null | cut -f1-4)
+        printf '%s  %s\n    last: %s\n' "$id" "$exe" "${last:-never run}"
+    done
+    exit 0
+fi
+
+if [ -z "$GAME_ID" ]; then
+    if [ $# -eq 0 ]; then
+        # Launched from the app menu with no file: offer a file chooser in GUI mode.
+        if [ "$GUI" = 1 ] && command -v zenity >/dev/null 2>&1; then
+            EXE=$(zenity --file-selection --title="Choose a Windows game (.exe)" \
+                  --file-filter="Windows programs | *.exe *.EXE" 2>/dev/null) || exit 0
+        else
+            usage >&2; exit 2
+        fi
+    else
+        EXE="$1"; shift
+    fi
+fi
+GAME_ARGS=("$@")
+
+# ---------------------------------------------------------------- resolve game
+if [ -n "$GAME_ID" ]; then
+    case "$GAME_ID" in *[!0-9a-f]*|"") die "bad id: $GAME_ID" 2 ;; esac
+    [ -f "$WL_STATE/games/$GAME_ID/exe" ] || die "no game recorded with id $GAME_ID (run it once by path first)"
+    EXE=$(cat "$WL_STATE/games/$GAME_ID/exe")
+fi
+
+case "$EXE" in file://*) # some file managers hand over URIs
+    EXE=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.argv[1][7:]))' "$EXE") ;;
+esac
+case "$EXE" in *$'\n'*) die "refusing a path that contains a newline" 2 ;; esac
+[ -f "$EXE" ] || die "file not found: $EXE"
+EXE=$(realpath -e -- "$EXE") || die "cannot resolve path: $EXE"
+GAME_DIR=$(dirname -- "$EXE")
+ID=$(game_id_for_dir "$GAME_DIR")
+if [ -n "$GAME_ID" ] && [ "$GAME_ID" != "$ID" ]; then
+    die "game folder moved since id $GAME_ID was recorded; run it by path to get its new id"
+fi
+
+PREFIX="$WL_DATA/prefixes/$ID"
+STATE="$WL_STATE/games/$ID"
+LOG="$STATE/last.log"
+
+[ -f "$WL_CONF/winlauncher.conf" ] && . "$WL_CONF/winlauncher.conf"
+[ -f "$WL_CONF/games/$ID.conf" ] && . "$WL_CONF/games/$ID.conf"
+
+ARCH=$(pe_arch "$EXE")
+[ "$ARCH" = "not-pe" ] && die "not a Windows program (no MZ header): $EXE"
+
+WINESERVER=$(find_wineserver) || WINESERVER=""
+command -v "$WL_WINE" >/dev/null 2>&1 || die "Wine not found ($WL_WINE). Install wine or set WL_WINE."
+
+OVERRIDES="winhttp=n,b;winemenubuilder.exe=d"
+[ -n "$WL_DLLOVERRIDES_EXTRA" ] && OVERRIDES="$OVERRIDES;$WL_DLLOVERRIDES_EXTRA"
+
+if [ "$MODE" = info ] || [ "$MODE" = dryrun ]; then
+    printf 'id        %s\nexe       %s\narch      %s\ncwd       %s\nprefix    %s (%s)\nlog       %s\nconfig    %s\noverrides %s\n' \
+        "$ID" "$EXE" "$ARCH" "$GAME_DIR" "$PREFIX" \
+        "$([ -f "$PREFIX/.winlauncher-ready" ] && echo ready || echo 'not created yet')" \
+        "$LOG" "$WL_CONF/games/$ID.conf" "$OVERRIDES"
+    if [ "$MODE" = dryrun ]; then
+        extra=""; for a in "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}"; do extra+=" $(printf '%q' "$a")"; done
+        printf 'would run: cd %q && WINEPREFIX=%q WINEDLLOVERRIDES=%q %q %q%s\n' \
+            "$GAME_DIR" "$PREFIX" "$OVERRIDES" "$WL_WINE" "$EXE" "$extra"
+    fi
+    exit 0
+fi
+
+export WINEPREFIX="$PREFIX" WINEARCH=win64 WINEDEBUG="$WL_WINEDEBUG"
+ensure_utf8_locale
+
+if [ "$MODE" = kill ]; then
+    [ -n "$WINESERVER" ] || die "wineserver not found"
+    "$WINESERVER" -k 2>/dev/null; echo "stopped prefix $ID"; exit 0
+fi
+
+mkdir -p "$STATE" "$WL_DATA/prefixes" || die "cannot create $STATE"
+printf '%s\n' "$EXE" > "$STATE/exe"
+printf '%s\n' "$GAME_DIR" > "$STATE/dir"
+
+# ---------------------------------------------------------------- bootstrap
+if [ ! -f "$PREFIX/.winlauncher-ready" ]; then
+    # Offline-safe first run: if wine-mono/wine-gecko are not installed system-wide,
+    # disable them so wineboot never tries to download anything.
+    boot_over="winemenubuilder.exe=d"
+    [ -d /usr/share/wine/mono ]  || boot_over="$boot_over;mscoree="
+    [ -d /usr/share/wine/gecko ] || boot_over="$boot_over;mshtml="
+    {
+        printf '=== %s  creating prefix %s (win64; 32-bit games run via WoW64)\n' "$(date '+%F %T')" "$PREFIX"
+        WINEDLLOVERRIDES="$boot_over" "$WL_WINE" wineboot -i
+        rc=$?
+        [ -n "$WINESERVER" ] && "$WINESERVER" -w
+        echo "wineboot exit $rc"
+    } >"$STATE/bootstrap.log" 2>&1
+    if [ -f "$PREFIX/system.reg" ]; then
+        date '+%F %T' > "$PREFIX/.winlauncher-ready"
+    else
+        die "could not create the Wine prefix. See $STATE/bootstrap.log"
+    fi
+fi
+
+if [ "$MODE" = winecfg ]; then
+    WINEDLLOVERRIDES="$OVERRIDES" exec "$WL_WINE" winecfg
+fi
+
+# ---------------------------------------------------------------- launch
+exec 9>"$STATE/lock"
+if ! flock -n 9; then
+    die "this game is already running (prefix $ID). Use 'winrun --kill --id $ID' if it is stuck." 3
+fi
+
+[ -f "$LOG" ] && mv -f "$LOG" "$STATE/prev.log"
+{
+    printf '=== winrun %s\n' "$(date '+%F %T')"
+    printf 'exe      %s\narch     %s\ncwd      %s\nprefix   %s\nWINEDLLOVERRIDES=%s\nlocale   %s\n' \
+        "$EXE" "$ARCH" "$GAME_DIR" "$PREFIX" "$OVERRIDES" "${LC_ALL:-${LANG:-}}"
+    "$WL_WINE" --version 2>&1
+    echo "==="
+} >"$LOG"
+
+cd "$GAME_DIR" || die "cannot enter game folder: $GAME_DIR"
+start=$(date +%s)
+WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1
+rc=$?
+# Launchers often exit while the real game keeps running; wait for the whole prefix.
+[ -n "$WINESERVER" ] && "$WINESERVER" -w 2>/dev/null
+secs=$(( $(date +%s) - start ))
+printf '=== exit %s after %ss\n' "$rc" "$secs" >>"$LOG"
+printf '%s\t%s\trc=%s\t%ss\t%s\n' "$(date '+%F %T')" "$ARCH" "$rc" "$secs" "$EXE" >>"$STATE/runs.tsv"
+
+if [ "$rc" -ne 0 ] && [ "$secs" -lt "$WL_STARTUP_SECS" ]; then
+    hint=$(grep -E '^(err:|wine: |Application tried|Unhandled exception|Crash!!!|.*[Ee]xception)' "$LOG" \
+           | grep -v '^err:.*fixme' | tail -n 6)
+    die "$(basename "$EXE") stopped during startup (exit code $rc after ${secs}s).
+
+Last errors:
+${hint:-  (no err: lines; read the log)}
+
+Full log: $LOG
+Prefix:   $PREFIX" 4
+fi
+exit "$rc"

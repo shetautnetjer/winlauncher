@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""wl-translate — install the runtime translation stack (Layer A) into a Unity game.
+
+  wl-translate <game folder or exe>                  # dry run (default): prints the plan
+  wl-translate <game folder or exe> --apply          # writes files, backs up anything replaced
+  wl-translate <game folder or exe> --uninstall      # dry run of the removal
+  wl-translate <game folder or exe> --uninstall --apply
+        [--remove-runtime-files]   # also move BepInEx's own runtime files (logs, cache,
+                                   # generated translations) out to the leftovers folder
+
+Stack: BepInEx + XUnity.AutoTranslator, pointed at the local endpoint
+(CustomTranslate, default http://127.0.0.1:8765/translate, ja -> en).
+
+  Unity Mono  x64 : BepInEx 5 x64  + XUnity (BepInEx 5)
+  Unity Mono  x86 : BepInEx 5 x86  + XUnity (BepInEx 5)
+  Unity IL2CPP    : BepInEx 6 BE IL2CPP + XUnity IL2CPP
+
+Packages are not bundled: download them once into the pkgs folder
+(default ~/.local/share/winlauncher/pkgs, or --pkgs / WL_PKGS). If one is
+missing, the dry run names the file and where to get it.
+
+Rules it follows: never deletes a game file; every file it overwrites is first
+copied to "<file>.wl-bak-<timestamp>" in the same folder; every file it creates
+is recorded with its sha256 in "<game>/.winlauncher-translate.json" (and a copy in
+~/.local/state/winlauncher/translate/), which is what --uninstall reverses.
+An existing BepInEx that this tool did not install is never overwritten.
+"""
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import wlcommon as wl  # noqa: E402
+
+DEFAULT_PKGS = Path(os.environ.get("WL_PKGS", Path.home() / ".local/share/winlauncher/pkgs"))
+DEFAULT_ENDPOINT = os.environ.get("WL_ENDPOINT", "http://127.0.0.1:8765/translate")
+MANIFEST = ".winlauncher-translate.json"
+STAMP = time.strftime("%Y%m%d-%H%M%S")
+
+# Accepted file names for each package (first match wins). Drop staged zips into the
+# pkgs folder under any of these names.
+PKG_PATTERNS = {
+    "bepinex5-x64": ["bepinex5_win_x64.zip", "BepInEx_win_x64_5*.zip", "BepInEx_x64_5*.zip"],
+    "bepinex5-x86": ["bepinex5_win_x86.zip", "BepInEx_win_x86_5*.zip", "BepInEx_x86_5*.zip"],
+    "xunity-bep5": ["xuat_bepinex.zip", "XUnity.AutoTranslator-BepInEx-5*.zip",
+                    "XUnity.AutoTranslator-BepInEx-[0-9]*.zip"],
+    "bepinex6-il2cpp-x64": ["bepinex6_il2cpp_win_x64.zip", "BepInEx-Unity.IL2CPP-win-x64-6*.zip"],
+    "bepinex6-il2cpp-x86": ["bepinex6_il2cpp_win_x86.zip", "BepInEx-Unity.IL2CPP-win-x86-6*.zip"],
+    "xunity-il2cpp": ["xuat_bepinex_il2cpp.zip", "XUnity.AutoTranslator-BepInEx-IL2CPP-*.zip"],
+}
+WHERE_TO_GET = {
+    "bepinex5-x64": "BepInEx 5 release page: BepInEx_win_x64_5.4.x.zip "
+                    "(github.com/BepInEx/BepInEx/releases)",
+    "xunity-bep5": "XUnity release page: XUnity.AutoTranslator-BepInEx-5.x.zip "
+                   "(github.com/bbepis/XUnity.AutoTranslator/releases)",
+    "bepinex5-x86": "BepInEx 5 release page: BepInEx_win_x86_5.4.x.zip "
+                    "(github.com/BepInEx/BepInEx/releases)",
+    "bepinex6-il2cpp-x64": "BepInEx bleeding-edge builds: BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.<N>.zip "
+                           "(builds.bepinex.dev/projects/bepinex_be)",
+    "bepinex6-il2cpp-x86": "BepInEx bleeding-edge builds: BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.<N>.zip "
+                           "(builds.bepinex.dev/projects/bepinex_be)",
+    "xunity-il2cpp": "XUnity release page: XUnity.AutoTranslator-BepInEx-IL2CPP-<ver>.zip "
+                     "(github.com/bbepis/XUnity.AutoTranslator/releases)",
+}
+
+# Files that belong to the BepInEx loader itself; never overwritten when a BepInEx
+# that we did not install is already present.
+LOADER_PATTERNS = ["winhttp.dll", "doorstop_config.ini", ".doorstop_version", "changelog.txt",
+                   "BepInEx/core/*", "dotnet/*", "BepInEx/patchers/*"]
+
+REQUIRED_INI = {
+    "Service": {"Endpoint": "CustomTranslate", "FallbackEndpoint": ""},
+    "General": {"Language": "en", "FromLanguage": "ja"},
+    "Custom": {"Url": None, "DisableSpamChecks": "True"},   # Url filled at runtime
+}
+FRESH_INI_EXTRA = {
+    "TextFrameworks": {"EnableUGUI": "True", "EnableNGUI": "True", "EnableTextMeshPro": "True",
+                       "EnableTextMesh": "True", "EnableIMGUI": "True"},
+    "Behaviour": {"MaxCharactersPerTranslation": "1000", "IgnoreWhitespaceInDialogue": "True",
+                  "EnableUIResizing": "True", "EnableBatching": "False",
+                  "UseStaticTranslations": "True"},
+}
+
+
+def read_ini(p: Path):
+    """Return (text, had_bom). XUnity writes its config with a UTF-8 BOM."""
+    raw = p.read_bytes()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    return raw.decode("utf-8-sig", errors="replace"), bom
+
+
+def write_ini(p: Path, text: str, bom: bool):
+    p.write_bytes((b"\xef\xbb\xbf" if bom else b"") + text.encode("utf-8"))
+
+
+def sha256(p: Path):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_pkg(pkgs: Path, key: str):
+    for pat in PKG_PATTERNS[key]:
+        hits = sorted(pkgs.glob(pat))
+        if hits:
+            return hits[-1]
+    return None
+
+
+def resolve_game(arg: str):
+    p = Path(arg).expanduser().resolve()
+    if p.is_file():
+        return p.parent, p
+    if not p.is_dir():
+        sys.exit(f"wl-translate: not found: {p}")
+    exe = wl.pick_main_exe(p)
+    if not exe:
+        sys.exit(f"wl-translate: no game .exe found under {p}")
+    return exe.parent, exe
+
+
+# ------------------------------------------------------------------ ini editing
+def ini_set(text: str, wanted: dict):
+    """Set section/key values in INI text, preserving every other line. Returns (text, changes)."""
+    lines = text.splitlines()
+    changes = []
+    for section, kv in wanted.items():
+        start = end = None
+        for i, ln in enumerate(lines):
+            s = ln.strip()
+            if s.startswith("[") and s.endswith("]"):
+                if start is not None and end is None:
+                    end = i
+                if s[1:-1] == section:
+                    start, end = i + 1, None
+        if start is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"[{section}]")
+            start = end = len(lines)
+        if end is None:
+            end = len(lines)
+        for key, val in kv.items():
+            found = False
+            for i in range(start, end):
+                k, sep, v = lines[i].partition("=")
+                if sep and k.strip() == key:
+                    found = True
+                    if v.strip() != val:
+                        changes.append(f"[{section}] {key}: {v.strip()!r} -> {val!r}")
+                        lines[i] = f"{key}={val}"
+                    break
+            if not found:
+                ins = end
+                while ins > start and not lines[ins - 1].strip():
+                    ins -= 1
+                lines.insert(ins, f"{key}={val}")
+                end += 1
+                changes.append(f"[{section}] {key}: (missing) -> {val!r}")
+    return "\n".join(lines) + "\n", changes
+
+
+# ------------------------------------------------------------------ planning
+def plan_install(game: Path, exe: Path, pkgs: Path, endpoint: str):
+    eng = wl.detect_engine(exe)
+    arch = (wl.pe_info(exe) or {}).get("arch", "?")
+    tstate = wl.translation_state(game)
+    manifest = wl.load_json(game / MANIFEST, None)
+    report = {"game": str(game), "exe": exe.name, "arch": arch, "engine": eng["engine"],
+              "unity": eng.get("detail", ""), "existing_bepinex": tstate["bepinex"],
+              "ours": manifest is not None, "actions": [], "problems": [], "notes": []}
+
+    if not eng["engine"].startswith("Unity"):
+        report["problems"].append(f"not a Unity game ({eng['engine']}); Layer A here is Unity-only. "
+                                  "See docs/LAYER-B.md for this engine.")
+        return report, []
+    flavour = eng["engine"].split()[1]
+    if flavour == "unknown":
+        report["problems"].append("Unity runtime unclear (no Managed/Assembly-CSharp.dll and no "
+                                  "GameAssembly.dll); inspect by hand.")
+        return report, []
+    if arch not in ("x64", "x86"):
+        report["problems"].append(f"unsupported exe architecture {arch}")
+        return report, []
+
+    if flavour == "Mono":
+        keys = [f"bepinex5-{arch}", "xunity-bep5"]
+        want_bep = "5"
+    else:
+        keys = [f"bepinex6-il2cpp-{arch}", "xunity-il2cpp"]
+        want_bep = "6"
+        report["notes"].append(
+            "IL2CPP: on its first launch BepInEx 6 generates interop assemblies and fetches Unity "
+            "base libraries for this Unity version from unity.bepinex.dev. That first launch needs "
+            "network once (or a pre-staged BepInEx/unity-libs); later launches are offline. "
+            "Expect the first start to take a few minutes.")
+
+    # A loader / XUnity that something else installed is kept as-is: no package needed
+    # for that part, only the config gets corrected.
+    foreign_loader = tstate["bepinex"] is not None and manifest is None
+    foreign_xunity = tstate["xunity"] and manifest is None
+    if foreign_loader:
+        keys = [k for k in keys if not k.startswith("bepinex")]
+    if foreign_xunity:
+        keys = [k for k in keys if not k.startswith("xunity")]
+        report["notes"].append("XUnity is already present and was not installed by wl-translate; "
+                               "its files are left untouched, only the config is corrected.")
+    zips = {}
+    for k in keys:
+        z = find_pkg(pkgs, k)
+        if not z:
+            report["problems"].append(f"missing package '{k}' in {pkgs}. Get: {WHERE_TO_GET.get(k, '?')}; "
+                                      f"save it there as one of: {', '.join(PKG_PATTERNS[k])}")
+        zips[k] = z
+    if report["problems"]:
+        return report, []
+
+    if tstate["bepinex"] and tstate["bepinex"] != want_bep:
+        report["problems"].append(f"BepInEx {tstate['bepinex']} is already installed but this game "
+                                  f"needs BepInEx {want_bep}; refusing to mix them.")
+        return report, []
+    if foreign_loader:
+        report["notes"].append("BepInEx is already present and was not installed by wl-translate; "
+                               "its loader files are left untouched.")
+    owned_created = {c["path"] for c in (manifest or {}).get("created", [])}
+
+    ops = []
+    for k, z in zips.items():
+        with zipfile.ZipFile(z) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                relp = info.filename.replace("\\", "/")
+                if relp.startswith("/") or ".." in Path(relp).parts:
+                    report["problems"].append(f"unsafe path in {z.name}: {relp}")
+                    continue
+                if foreign_loader and any(fnmatch.fnmatch(relp, pat) for pat in LOADER_PATTERNS):
+                    continue
+                if relp.lower().endswith("autotranslatorconfig.ini"):
+                    continue
+                dest = game / relp
+                data_sha = hashlib.sha256(zf.read(info)).hexdigest()
+                if dest.exists():
+                    if sha256(dest) == data_sha:
+                        continue                                      # already identical
+                    kind = "replace-ours" if relp in owned_created else "overwrite"
+                else:
+                    kind = "create"
+                ops.append({"kind": kind, "rel": relp, "zip": str(z), "member": info.filename,
+                            "sha": data_sha})
+
+    cfg_rel = "BepInEx/config/AutoTranslatorConfig.ini"
+    cfg = game / cfg_rel
+    wanted = json.loads(json.dumps(REQUIRED_INI))
+    wanted["Custom"]["Url"] = endpoint
+    if cfg.exists():
+        _, changes = ini_set(read_ini(cfg)[0], wanted)
+        if changes:
+            ops.append({"kind": "edit-config", "rel": cfg_rel, "changes": changes, "wanted": wanted})
+    else:
+        fresh = dict(wanted, **FRESH_INI_EXTRA)
+        ops.append({"kind": "create-config", "rel": cfg_rel, "wanted": fresh})
+
+    report["actions"] = ops
+    return report, ops
+
+
+def print_plan(report, ops, apply_mode):
+    print(f"game      {report['game']}")
+    print(f"exe       {report['exe']}  [{report['arch']}]")
+    print(f"engine    {report['engine']} {report['unity']}")
+    print(f"BepInEx   {('v' + report['existing_bepinex']) if report['existing_bepinex'] else 'absent'}"
+          f"{' (installed by wl-translate)' if report['ours'] else ''}")
+    for n in report["notes"]:
+        print(f"note      {n}")
+    if report["problems"]:
+        for p in report["problems"]:
+            print(f"BLOCKED   {p}")
+        return
+    counts = {}
+    for o in ops:
+        counts[o["kind"]] = counts.get(o["kind"], 0) + 1
+    if not ops:
+        print("\nNothing to do: everything is already installed and configured.")
+        return
+    print(f"\n{'Applying' if apply_mode else 'Would apply'}: "
+          + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    for o in ops:
+        if o["kind"] in ("overwrite", "replace-ours"):
+            print(f"  overwrite {o['rel']}  (backup -> {o['rel']}.wl-bak-{STAMP})")
+        elif o["kind"] == "edit-config":
+            print(f"  edit      {o['rel']}  (backup -> {o['rel']}.wl-bak-{STAMP})")
+            for c in o["changes"]:
+                print(f"              {c}")
+        elif o["kind"] == "create-config":
+            print(f"  create    {o['rel']}  (Endpoint=CustomTranslate, no fallback, ja->en)")
+    created = [o for o in ops if o["kind"] == "create"]
+    if created:
+        print(f"  create    {len(created)} new files, e.g. " + ", ".join(o["rel"] for o in created[:4]))
+
+
+# ------------------------------------------------------------------ apply
+def apply_install(game: Path, report, ops):
+    mpath = game / MANIFEST
+    manifest = wl.load_json(mpath, None) or {"tool": "wl-translate", "game": str(game),
+                                             "installed": STAMP, "created": [], "backups": [],
+                                             "created_dirs": []}
+    manifest["updated"] = STAMP
+    zcache = {}
+
+    def ensure_dir(d: Path):
+        missing = []
+        while not d.exists():
+            missing.append(d)
+            d = d.parent
+        for m in reversed(missing):
+            m.mkdir()
+            manifest["created_dirs"].append(str(m.relative_to(game)))
+
+    def backup(dest: Path, rel: str):
+        bak = dest.with_name(f"{dest.name}.wl-bak-{STAMP}")
+        shutil.copy2(dest, bak)
+        manifest["backups"].append({"path": rel, "backup": str(bak.relative_to(game))})
+        print(f"  backed up {rel}")
+
+    for o in ops:
+        dest = game / o["rel"]
+        ensure_dir(dest.parent)
+        if o["kind"] in ("create", "overwrite", "replace-ours"):
+            if o["kind"] == "overwrite":
+                backup(dest, o["rel"])
+            zf = zcache.setdefault(o["zip"], zipfile.ZipFile(o["zip"]))
+            tmp = dest.with_name(dest.name + ".wl-tmp")
+            with zf.open(o["member"]) as src, open(tmp, "wb") as out:
+                shutil.copyfileobj(src, out)
+            os.replace(tmp, dest)
+            manifest["created"] = [c for c in manifest["created"] if c["path"] != o["rel"]]
+            if o["kind"] != "overwrite":
+                manifest["created"].append({"path": o["rel"], "sha256": o["sha"]})
+        elif o["kind"] == "edit-config":
+            backup(dest, o["rel"])
+            old_text, bom = read_ini(dest)
+            text, _ = ini_set(old_text, o["wanted"])
+            write_ini(dest, text, bom)
+            print(f"  edited {o['rel']}")
+        elif o["kind"] == "create-config":
+            text, _ = ini_set("", o["wanted"])
+            dest.write_text(text, encoding="utf-8")
+            manifest["created"].append({"path": o["rel"], "sha256": None, "config": True})
+            print(f"  wrote {o['rel']}")
+
+    mpath.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    copy = wl.WL_STATE / "translate" / f"{wl.game_id(game)}.json"
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\nmanifest  {mpath}\n          (copy: {copy})")
+
+
+# ------------------------------------------------------------------ uninstall
+def do_uninstall(game: Path, apply_mode: bool, remove_runtime: bool):
+    mpath = game / MANIFEST
+    manifest = wl.load_json(mpath, None)
+    if manifest is None:
+        manifest = wl.load_json(wl.WL_STATE / "translate" / f"{wl.game_id(game)}.json", None)
+    if manifest is None:
+        print("No wl-translate manifest for this game: nothing installed by this tool.")
+        if (game / "BepInEx").exists():
+            print("A BepInEx folder exists but was installed by something else; left alone.")
+        return 0
+    leftovers = wl.WL_STATE / "translate-leftovers" / f"{wl.game_id(game)}-{STAMP}"
+    verb = "" if apply_mode else "would "
+
+    def stash(p: Path):
+        dest = leftovers / p.relative_to(game)
+        print(f"  {verb}move {p.relative_to(game)} -> {dest}")
+        if apply_mode:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(dest))
+
+    for b in manifest.get("backups", []):
+        orig, bak = game / b["path"], game / b["backup"]
+        if bak.exists():
+            print(f"  {verb}restore {b['path']} from {b['backup']}")
+            if apply_mode:
+                os.replace(bak, orig)
+        else:
+            print(f"  backup missing, cannot restore: {b['backup']}")
+    restored = {b["path"] for b in manifest.get("backups", [])}
+    for c in manifest.get("created", []):
+        p = game / c["path"]
+        if c["path"] in restored or not p.exists():
+            continue
+        if c.get("sha256") and sha256(p) == c["sha256"]:
+            print(f"  {verb}remove {c['path']}")
+            if apply_mode:
+                p.unlink()
+        else:
+            stash(p)          # ours, but changed since (e.g. config rewritten by XUnity)
+    if remove_runtime:
+        for d in sorted(manifest.get("created_dirs", []), key=lambda s: -len(s)):
+            p = game / d
+            if p.is_dir() and any(p.iterdir()) and p.name == "BepInEx":
+                for child in sorted(p.rglob("*"), key=lambda x: -len(x.parts)):
+                    if child.is_file():
+                        stash(child)
+    for d in sorted(manifest.get("created_dirs", []), key=lambda s: -len(s)):
+        p = game / d
+        if p.is_dir():
+            if apply_mode:
+                try:
+                    p.rmdir()
+                    print(f"  removed empty folder {d}")
+                except OSError:
+                    print(f"  kept {d}/ (still has files the game or BepInEx created; "
+                          "use --remove-runtime-files to move them out)")
+            else:
+                print(f"  {verb}remove folder {d} if empty")
+    if apply_mode:
+        mpath.unlink(missing_ok=True)
+        (wl.WL_STATE / "translate" / f"{wl.game_id(game)}.json").unlink(missing_ok=True)
+        print("uninstalled." + (f" Moved files are in {leftovers}" if leftovers.exists() else ""))
+    else:
+        print("\nDRY RUN. Re-run with --uninstall --apply to do it.")
+    return 0
+
+
+def endpoint_ok(url: str):
+    try:
+        q = url + ("&" if "?" in url else "?") + "from=ja&to=en&text=%E3%81%AF%E3%81%84"
+        with urllib.request.urlopen(q, timeout=5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("game")
+    ap.add_argument("--apply", action="store_true", help="actually write (default is dry run)")
+    ap.add_argument("--dry-run", action="store_true", help="default; kept for clarity")
+    ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--remove-runtime-files", action="store_true")
+    ap.add_argument("--pkgs", type=Path, default=DEFAULT_PKGS)
+    ap.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    a = ap.parse_args()
+    apply_mode = a.apply and not a.dry_run
+    game, exe = resolve_game(a.game)
+
+    if a.uninstall:
+        return do_uninstall(game, apply_mode, a.remove_runtime_files)
+
+    report, ops = plan_install(game, exe, a.pkgs.expanduser(), a.endpoint)
+    print_plan(report, ops, apply_mode)
+    if report["problems"]:
+        return 3
+    if not ops:
+        return 0
+    if not apply_mode:
+        print(f"\nDRY RUN: nothing written. Re-run with --apply to install:\n"
+              f"  wl-translate {sh(game)} --apply")
+    else:
+        apply_install(game, report, ops)
+        if not endpoint_ok(a.endpoint):
+            print(f"\nwarning: the endpoint {a.endpoint} did not answer just now. The game will "
+                  "still start; text stays Japanese until the endpoint is running.")
+    print(f"\nTo uninstall later:\n  wl-translate {sh(game)} --uninstall --apply\n"
+          "  (restores every backup, removes only files this tool created, moves anything "
+          "changed since to ~/.local/state/winlauncher/translate-leftovers/)")
+    print("Launch the game with winrun (it sets WINEDLLOVERRIDES=winhttp=n,b so BepInEx loads).")
+    return 0
+
+
+def sh(p):
+    import shlex
+    return shlex.quote(str(p))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

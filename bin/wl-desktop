@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# wl-desktop — per-game app-menu entries that launch through winrun.
+#
+#   wl-desktop add <game.exe> [--name "Menu name"]
+#   wl-desktop remove <game.exe | ID>
+#   wl-desktop list
+#
+# Entries are ~/.local/share/applications/winlauncher-<ID>.desktop and call
+# `winrun --gui --id <ID>`, so the .desktop file never has to quote the game path
+# (spaces, brackets and CJK in paths cannot break it).
+set -u
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+WINRUN="${WINRUN:-$HOME/.local/bin/winrun}"
+
+die() { printf 'wl-desktop: %s\n' "$1" >&2; exit "${2:-1}"; }
+idof() { local d; d=$(dirname -- "$(realpath -e -- "$1")") || return 1; printf '%s' "$d" | sha256sum | cut -c1-16; }
+refresh() { command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true; }
+
+# Desktop Entry string escaping for Name=: backslash, newline, tab, CR
+esc() { local s="$1"; s=${s//\\/\\\\}; s=${s//$'\n'/ }; s=${s//$'\t'/ }; s=${s//$'\r'/}; printf '%s' "$s"; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+add)
+    exe="${1:-}"; shift || true; [ -f "$exe" ] || die "no such file: $exe"
+    name=""
+    [ "${1:-}" = "--name" ] && name="${2:-}"
+    id=$(idof "$exe") || die "cannot resolve $exe"
+    "$WINRUN" --info "$exe" >/dev/null || die "winrun cannot handle $exe"
+    [ -n "$name" ] || name=$(basename -- "$(dirname -- "$(realpath -e -- "$exe")")" | sed 's/ (extracted)$//')
+    mkdir -p "$APPS" "${XDG_STATE_HOME:-$HOME/.local/state}/winlauncher/games/$id"
+    realpath -e -- "$exe" > "${XDG_STATE_HOME:-$HOME/.local/state}/winlauncher/games/$id/exe"
+    f="$APPS/winlauncher-$id.desktop"
+    tmpd=$(mktemp -d); tmp="$tmpd/winlauncher-$id.desktop"
+    cat > "$tmp" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=$(esc "$name")
+Comment=Windows game via winrun (prefix $id)
+Exec="$WINRUN" --gui --id $id
+Icon=applications-games
+Terminal=false
+Categories=Game;
+StartupNotify=false
+X-Winlauncher-Id=$id
+EOF
+    if command -v desktop-file-validate >/dev/null; then desktop-file-validate "$tmp" || { rm -rf "$tmpd"; die "generated entry failed validation"; }; fi
+    cp -f "$tmp" "$f.part" && mv -f "$f.part" "$f"; rm -rf "$tmpd"
+    refresh
+    echo "added $f"
+    ;;
+remove)
+    t="${1:-}"; [ -n "$t" ] || die "usage: wl-desktop remove <game.exe|ID>"
+    if [ -f "$t" ]; then id=$(idof "$t"); else id="$t"; fi
+    case "$id" in *[!0-9a-f]*|"") die "bad id: $id" ;; esac
+    f="$APPS/winlauncher-$id.desktop"
+    [ -f "$f" ] || die "no entry for $id"
+    rm -f -- "$f"; refresh; echo "removed $f"
+    ;;
+list)
+    for f in "$APPS"/winlauncher-*.desktop; do
+        [ -f "$f" ] || continue
+        printf '%s\t%s\n' "$(sed -n 's/^X-Winlauncher-Id=//p' "$f")" "$(sed -n 's/^Name=//p' "$f" | head -1)"
+    done
+    ;;
+*) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] && exit 0; exit 2 ;;
+esac

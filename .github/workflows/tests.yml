@@ -1,0 +1,17 @@
+name: tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline test suite (fake Wine)
+        run: bash tests/run-tests.sh
+      - name: ShellCheck (errors only)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S error bin/winrun bin/wl-desktop install.sh uninstall.sh tests/*.sh

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Run with Wine (winlauncher)
+GenericName=Windows program launcher
+Comment=Run a Windows .exe with its own Wine prefix; working folder = the exe's folder
+Exec="@WINRUN@" --gui %f
+Icon=applications-games
+Terminal=false
+Categories=Game;
+MimeType=application/vnd.microsoft.portable-executable;application/x-msdownload;application/x-ms-dos-executable;
+StartupNotify=false
+Keywords=wine;exe;windows;game;
