@@ -21,7 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import wlcommon as wl  # noqa: E402
 
-SKIP_TOP = {"_tools", "Archives", "installed zips", "DLsite"}
+# Top-level folders that are not games: "Archives", anything starting with "_" or ".",
+# plus any names listed in WL_SCAN_SKIP (colon-separated).
+SKIP_TOP = {"Archives"} | {n for n in os.environ.get("WL_SCAN_SKIP", "").split(":") if n}
 
 LAYER = {  # what kind of English each engine can get
     "Unity Mono": "A: wl-translate (automated)",
@@ -80,7 +82,7 @@ def main():
     lib = Path(a.library).expanduser().resolve()
     rows = []
     for top in sorted(p for p in lib.iterdir() if p.is_dir() and p.name not in SKIP_TOP
-                      and not p.name.startswith(".")):
+                      and not p.name.startswith((".", "_"))):
         try:
             rows += scan_folder(top)
         except (OSError, ValueError) as e:
