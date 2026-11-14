@@ -29,3 +29,7 @@
   files; status/, LOCAL-NOTES.md and pkgs/ are git-ignored.
 - Defaults: packages in ~/.local/share/winlauncher/pkgs, library in $WL_LIBRARY or ~/Games.
 - License proposed: MIT (pending maintainer confirmation).
+
+## 2026-11-14T09:53Z: Published
+- Maintainer chose: public repository github.com/shetautnetjer/winlauncher, MIT
+  license (supersedes "pending maintainer confirmation" above).
