@@ -66,6 +66,12 @@ usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 find_wineserver() {
     [ -n "$WL_WINESERVER" ] && { printf '%s\n' "$WL_WINESERVER"; return; }
     local c
+    # An alternate Wine (e.g. a portable build picked per game) must also supply
+    # its own wineserver: mixing a 11.x client with a 10.x server corrupts state.
+    case $WL_WINE in
+        /*) c="$(dirname "$WL_WINE")/wineserver"
+            [ -x "$c" ] && { printf '%s\n' "$c"; return; } ;;
+    esac
     for c in "$(command -v wineserver 2>/dev/null)" \
              /usr/lib/x86_64-linux-gnu/wine/wineserver /usr/lib/wine/wineserver \
              /usr/lib64/wine/wineserver /opt/wine-stable/bin/wineserver; do
@@ -311,6 +317,7 @@ case "$WL_DRIVER" in
         ;;
 esac
 
+EXE_WIN=""   # set only in virtual-desktop mode; avoid unbound-variable aborts
 start=$(date +%s)
 trap 'printf "%s\t%s\trc=term\t%ss\t%s\n" "$(date "+%F %T")" "$ARCH" \
         "$(( $(date +%s) - start ))" "$EXE" >>"$STATE/runs.tsv"; exit 143' TERM INT

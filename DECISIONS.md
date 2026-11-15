@@ -51,3 +51,32 @@
 - The test helpers dl-sweep.sh (real library paths) and keyprobe.py (needs Pillow;
   deleted ~/Pictures/Screenshot.png before each capture, now parks and restores it)
   are lab tools, kept outside the repo.
+
+## Unity 6 games need Wine >= 11.3 (pointer input), not Wine 10
+
+Unity 6's Windows input backend calls `EnableMouseInPointer(TRUE)` and then reads
+only `WM_POINTER*` messages. Wine before 11.3 exports those Win8 pointer APIs as
+stubs returning `ERROR_CALL_NOT_IMPLEMENTED`, and never generates a pointer
+message, so the game ignores the legacy `WM_MOUSE*` events Wine does deliver.
+
+Evidence in the game's own Unity log:
+
+    EnableMouseInPointer failed with the following error: Call not implemented.
+
+On Unity 6000.2.x the symptom is a completely frozen cursor; on 6000.3.x the
+cursor moves but clicks never register. Keyboard can appear dead too because the
+UI never gets its first click.
+
+Fix: upstream Wine implemented this in 11.3 (Feb 2026). A portable Wine 11.22
+staging build lives in ~/aya/tools/wine-portable and is selected per game with
+`WL_WINE=` in `~/.config/winlauncher/games/<id>.conf`; `find_wineserver` follows
+`WL_WINE` so a 11.x client never pairs with a 10.x server. Verified on Femboy
+Futa House: the failure line disappears from the log and clicks work.
+
+Five titles in this library are Unity 6 and are configured this way:
+MASSAGE MY EX-BULLY, Femboy Futa House, Sex Education Trainer,
+Roommate Life with your Cute Former Labmate, GyakuTobatsu.
+
+Not a click-capture problem: `WL_MOUSE_WARP=disable` (added earlier) is kept for
+games that hold a relative-mouse grab, but it does not fix Unity 6 tiles - the
+pointer moved freely there and clicks still never arrived.
