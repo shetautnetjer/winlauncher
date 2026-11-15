@@ -91,7 +91,16 @@ def main():
     root = xlib.XDefaultRootWindow(dpy)
     wid = int(target["id"], 16)
 
-    # 1. raise it (so it is not buried under other windows)
+    # 1. ask the WM to keep it above everything, then raise it. A plain raise is
+    #    not sticky under mutter: the next window that opens covers the game and
+    #    swallows every click.
+    atom_state = xlib.XInternAtom(ctypes.c_void_p(dpy), b"_NET_WM_STATE", False)
+    atom_above = xlib.XInternAtom(ctypes.c_void_p(dpy), b"_NET_WM_STATE_ABOVE", False)
+    atom_full = xlib.XInternAtom(ctypes.c_void_p(dpy), b"_NET_WM_STATE_FULLSCREEN", False)
+    states = (ctypes.c_ulong * 2)(atom_above, atom_full)
+    xlib.XChangeProperty(ctypes.c_void_p(dpy), ctypes.c_ulong(wid), ctypes.c_ulong(atom_state),
+                         ctypes.c_ulong(4), 32, 0,                     # XA_ATOM, replace
+                         states, 2)
     xlib.XRaiseWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(wid))
 
     # 2. ask the window manager to activate it: some window managers only

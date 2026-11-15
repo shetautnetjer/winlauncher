@@ -302,7 +302,18 @@ if [ "$WL_VIRTUALDESK" = 1 ]; then
     done
     wait "$wine_pid"
 else
-    WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1 9>&-
+    WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1 9>&- &
+    wine_pid=$!
+    # Same treatment without a virtual desktop: raise + pin the window, otherwise
+    # the next window that opens (including a chat app) covers the game and takes
+    # every click - the game looks alive but ignores the mouse.
+    [ -n "$WL_FOCUS" ] || WL_FOCUS="$(dirname "$(readlink -f "$0")")/wl-focus"
+    for _ in $(seq 1 24); do
+        sleep 0.5
+        "$WL_FOCUS" "$(basename "$EXE")" >>"$LOG" 2>&1
+        case $? in 0|3) break ;; esac
+    done
+    wait "$wine_pid"
 fi
 rc=$?
 # Launchers often exit while the real game keeps running; wait for the whole prefix.
