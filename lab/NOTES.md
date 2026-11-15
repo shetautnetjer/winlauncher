@@ -37,3 +37,18 @@ Games report "controls not responsive" / "clicks do nothing". Distinguish three 
 - Unity IL2CPP: BepInEx 6 BE 793 + XUnity IL2CPP. Proven on one title
   (`ロード=Load`, `設定=Configuration` written by the running game).
 - Non-Unity (Godot, RPG Maker MZ, Flash, WolfRPG, Electron): asset-level work, not started.
+
+## Publishing to the public repo
+
+`main` tracks lab/ and is pushed only to `private`. The public remote receives a
+sanitised branch:
+
+    git branch -f public-sanitized main
+    git checkout public-sanitized
+    FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f \
+        --index-filter 'git rm -r --cached --ignore-unmatch lab' --prune-empty public-sanitized
+    git push --force origin public-sanitized:main
+    git checkout main
+
+Never `git push origin main`: local main carries lab/ (real titles and paths) and
+would re-add it to the public history.
