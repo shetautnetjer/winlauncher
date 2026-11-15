@@ -12,6 +12,10 @@
 #   --winecfg      open winecfg inside that game's prefix
 #   --desktop [WxH]  run inside a Wine virtual desktop window (fixes games whose
 #                  window maps but never appears under Wayland/mutter)
+#   --wayland      use Wine's native Wayland driver for this launch (real Wayland
+#                  window: compositor focus and keyboard routing work); implies
+#                  no virtual desktop
+#   --x11          revert the prefix to the X11 driver
 #   --dry-run      print what would run, run nothing
 #   -h, --help
 #
@@ -32,6 +36,7 @@ WL_DLLOVERRIDES_EXTRA="${WL_DLLOVERRIDES_EXTRA:-}"
 WL_LOCALE="${WL_LOCALE:-}"                  # e.g. ja_JP.UTF-8 for Shift-JIS engines
 WL_STARTUP_SECS="${WL_STARTUP_SECS:-20}"    # exits faster than this count as startup failures
 WL_EXTRA_ARGS=()                            # extra args appended to the game command line
+WL_DRIVER="${WL_DRIVER:-}"                  # "" keep as-is | wayland | x11 (Wine graphics driver)
 WL_VIRTUALDESK="${WL_VIRTUALDESK:-0}"       # 1 = run inside a Wine virtual desktop window
 WL_VIRTUALDESK_SIZE="${WL_VIRTUALDESK_SIZE:-1920x1080}"
 WL_FOCUS="${WL_FOCUS:-}"                    # focus helper; default bin/wl-focus next to winrun
@@ -103,6 +108,8 @@ while [ $# -gt 0 ]; do
         --kill) MODE='kill' ;;
         --winecfg) MODE=winecfg ;;
         --dry-run) MODE=dryrun ;;
+        --wayland) WL_DRIVER=wayland ;;
+        --x11) WL_DRIVER=x11 ;;
         --desktop)
             WL_VIRTUALDESK=1
             case "${2:-}" in
@@ -178,6 +185,7 @@ OVERRIDES="winhttp=n,b;winemenubuilder.exe=d"
 [ -n "$WL_DLLOVERRIDES_EXTRA" ] && OVERRIDES="$OVERRIDES;$WL_DLLOVERRIDES_EXTRA"
 
 if [ "$MODE" = info ] || [ "$MODE" = dryrun ]; then
+    printf 'driver    %s\n' "${WL_DRIVER:-unchanged}"
     printf 'id        %s\nexe       %s\narch      %s\ncwd       %s\nprefix    %s (%s)\nlog       %s\nconfig    %s\noverrides %s\n' \
         "$ID" "$EXE" "$ARCH" "$GAME_DIR" "$PREFIX" \
         "$([ -f "$PREFIX/.winlauncher-ready" ] && echo ready || echo 'not created yet')" \
@@ -248,7 +256,30 @@ fi
 } >"$LOG"
 
 cd "$GAME_DIR" || die "cannot enter game folder: $GAME_DIR"
+
+# Wine graphics driver. Under Wayland the X11 driver leaves the game as an
+# XWayland client whose surface never becomes the active Wayland surface: the
+# window shows but the keyboard goes elsewhere. The Wayland driver makes it a
+# real Wayland window, so compositor focus and key routing work.
+case "$WL_DRIVER" in
+    wayland)
+        # Wine picks its graphics driver when the prefix's wineserver starts. A
+        # server still alive from an earlier X11 run makes the Wayland setting a
+        # no-op - the game silently stays XWayland (and stays deaf to the keyboard).
+        [ -n "$WINESERVER" ] && "$WINESERVER" -k 2>/dev/null && sleep 1
+        "$WL_WINE" reg add "HKCU\\Software\\Wine\\Drivers" /v Graphics /t REG_SZ /d wayland /f >>"$LOG" 2>&1
+        printf 'driver   wayland (native Wayland window)\n' >>"$LOG"
+        WL_VIRTUALDESK=0
+        ;;
+    x11)
+        "$WL_WINE" reg delete "HKCU\\Software\\Wine\\Drivers" /v Graphics /f >>"$LOG" 2>&1
+        printf 'driver   x11 (XWayland)\n' >>"$LOG"
+        ;;
+esac
+
 start=$(date +%s)
+trap 'printf "%s\t%s\trc=term\t%ss\t%s\n" "$(date "+%F %T")" "$ARCH" \
+        "$(( $(date +%s) - start ))" "$EXE" >>"$STATE/runs.tsv"; exit 143' TERM INT
 if [ "$WL_VIRTUALDESK" = 1 ]; then
     # Some Wine windows map as viewable but are never raised/composited by the desktop
     # (seen under mutter/Wayland): the game runs invisibly behind other windows.
@@ -257,7 +288,7 @@ if [ "$WL_VIRTUALDESK" = 1 ]; then
     [ -n "$EXE_WIN" ] || EXE_WIN="$EXE"
     printf 'mode     virtual desktop wl-%s %s\n' "$ID" "$WL_VIRTUALDESK_SIZE" >>"$LOG"
     WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" explorer "/desktop=wl-$ID,$WL_VIRTUALDESK_SIZE" \
-        "$EXE_WIN" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1 &
+        "$EXE_WIN" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1 9>&- &
     wine_pid=$!
     # Keyboard focus: a mapped Wine window can still not be the active window, so
     # WASD/arrows go nowhere and the game looks frozen. Grab focus once it appears.
@@ -271,7 +302,7 @@ if [ "$WL_VIRTUALDESK" = 1 ]; then
     done
     wait "$wine_pid"
 else
-    WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1
+    WINEDLLOVERRIDES="$OVERRIDES" "$WL_WINE" "$EXE" "${WL_EXTRA_ARGS[@]}" "${GAME_ARGS[@]}" >>"$LOG" 2>&1 9>&-
 fi
 rc=$?
 # Launchers often exit while the real game keeps running; wait for the whole prefix.
@@ -283,6 +314,11 @@ printf '%s\t%s\trc=%s\t%ss\t%s\n' "$(date '+%F %T')" "$ARCH" "$rc" "$secs" "$EXE
 if [ "$rc" -ne 0 ] && [ "$secs" -lt "$WL_STARTUP_SECS" ]; then
     hint=$(grep -E '^(err:|wine: |Application tried|Unhandled exception|Crash!!!|.*[Ee]xception)' "$LOG" \
            | grep -v '^err:.*fixme' | tail -n 6)
+    if grep -q 'wayland_gl_drawable_create\|Failed to create EGL surface' "$LOG" 2>/dev/null; then
+        hint="${hint}
+note: the Wayland graphics driver could not create a GL surface for this title.
+      Revert with: winrun --x11 <game.exe>   (then optionally --desktop)"
+    fi
     die "$(basename "$EXE") stopped during startup (exit code $rc after ${secs}s).
 
 Last errors:
