@@ -190,6 +190,7 @@ if [ "$MODE" = info ] || [ "$MODE" = dryrun ]; then
         "$ID" "$EXE" "$ARCH" "$GAME_DIR" "$PREFIX" \
         "$([ -f "$PREFIX/.winlauncher-ready" ] && echo ready || echo 'not created yet')" \
         "$LOG" "$WL_CONF/games/$ID.conf" "$OVERRIDES"
+    printf 'mouse     %s\n' "${WL_MOUSE_WARP:-untouched}"
     if [ "$WL_VIRTUALDESK" = 1 ]; then
         printf 'mode      virtual desktop wl-%s %s (keyboard focus grabbed after start)\n' "$ID" "$WL_VIRTUALDESK_SIZE"
     else
@@ -203,6 +204,37 @@ if [ "$MODE" = info ] || [ "$MODE" = dryrun ]; then
     exit 0
 fi
 
+
+# Relative-mouse capture: many Windows games grab the pointer and warp it to a
+# fixed point every frame to read deltas. Under XWayland the warp wins forever,
+# so the cursor never lands on the game's UI and clicks appear to do nothing
+# (typically at an age gate or main menu). Wine's MouseWarpOverride=disable
+# stops the warp; the game still gets motion events, it just cannot move the
+# cursor behind the user's back.
+apply_mouse_warp() {
+    local want="$1" cur
+    [ -n "$want" ] || return 0
+    case $want in enable|disable|force) : ;; *) return 0 ;; esac
+    cur=$("$WL_WINE" reg query 'HKCU\Software\Wine\DirectInput' /v MouseWarpOverride 2>/dev/null \
+          | awk '/MouseWarpOverride/{print $NF}' | tr -d '\r')
+    [ "$cur" = "$want" ] && return 0
+    "$WL_WINE" reg add 'HKCU\Software\Wine\DirectInput' /v MouseWarpOverride \
+        /t REG_SZ /d "$want" /f >/dev/null 2>&1
+    WL_WARP_WAS="${cur:-unset}"
+    [ "$want" = disable ] && printf 'mouse: pointer capture disabled (was %s)\n' "${WL_WARP_WAS}"
+    return 0
+}
+
+restore_mouse_warp() {
+    [ -n "${WL_WARP_WAS:-}" ] || return 0
+    if [ "$WL_WARP_WAS" = unset ]; then
+        "$WL_WINE" reg delete 'HKCU\Software\Wine\DirectInput' /v MouseWarpOverride /f >/dev/null 2>&1
+    else
+        "$WL_WINE" reg add 'HKCU\Software\Wine\DirectInput' /v MouseWarpOverride \
+            /t REG_SZ /d "$WL_WARP_WAS" /f >/dev/null 2>&1
+    fi
+}
+
 export WINEPREFIX="$PREFIX" WINEARCH=win64 WINEDEBUG="$WL_WINEDEBUG"
 ensure_utf8_locale
 
@@ -212,6 +244,8 @@ if [ "$MODE" = kill ]; then
 fi
 
 mkdir -p "$STATE" "$WL_DATA/prefixes" || die "cannot create $STATE"
+apply_mouse_warp "${WL_MOUSE_WARP:-}"
+trap 'restore_mouse_warp' EXIT
 printf '%s\n' "$EXE" > "$STATE/exe"
 printf '%s\n' "$GAME_DIR" > "$STATE/dir"
 
