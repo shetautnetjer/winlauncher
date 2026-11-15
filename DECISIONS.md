@@ -79,3 +79,26 @@ is kept in the private lab repo, not here.
 Not a click-capture problem: `WL_MOUSE_WARP=disable` (added earlier) is kept for
 games that hold a relative-mouse grab, but it does not fix Unity 6 tiles - the
 pointer moved freely there and clicks still never arrived.
+
+## Electron games: proxy-extracted, occlusion flags, in-process GPU
+
+Three separate things bite Electron titles under Wine, all seen on one game:
+
+1. **The .exe is an NSIS self-extractor.** `*-Portable.exe` is a 380 MB stub that
+   re-extracts an Electron payload (`$PLUGINSDIR/app-64.7z`) to a temp dir on
+   every launch. Extract once with `7z x` twice (stub, then app-64.7z) and run the
+   inner executable: startup becomes normal and the game folder becomes stable
+   enough to configure.
+2. **Chromium pauses and throttles when it believes its window is occluded.**
+   Compositors under Wine report occlusion wrongly, which reads as the game
+   freezing mid-play for no reason. Launch with
+   `--disable-features=CalculateNativeWinOcclusion --disable-renderer-backgrounding
+   --disable-backgrounding-occluded-windows --disable-background-timer-throttling`.
+3. **The GPU process crashes on startup** (`GPU process exited unexpectedly`,
+   exit_code 34 or -2147483645) after `libEGL warning: egl: failed to create dri2
+   screen`, and Chromium silently falls back to `swiftshader-webgl` (software).
+   `--use-angle=d3d11` alone did not stop it; `--in-process-gpu` did - 3 crashes
+   before, 0 after, with DXVK providing the d3d11 backend.
+
+`--disable-gpu` is the fallback when in-process GPU also fails: stable software
+rendering beats a crash loop, at the cost of speed.
