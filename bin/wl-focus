@@ -41,18 +41,26 @@ def tree():
     return wins
 
 
+MIN_W, MIN_H = 320, 240   # below this it is a helper/IME/DXGI surface, not the game
+
+
 def pick(arg, wins):
     if arg:
         if arg.startswith("0x"):
             return next((w for w in wins if w["id"] == arg), None)
         low = arg.lower()
         matches = [w for w in wins if low in w["cls"].lower() or low in w["name"].lower()]
-        # prefer the largest matching window: helper windows are 1x1
-        return max(matches, key=lambda w: w["w"] * w["h"]) if matches else None
+        # Only real windows count. Wine creates 1x1 / 113x2 / ~300px helper
+        # surfaces with the same class, and focusing one of those looks like
+        # success while the game window stays unpinned and unclickable.
+        real = [w for w in matches if w["w"] >= MIN_W and w["h"] >= MIN_H]
+        if not real:
+            return None
+        return max(real, key=lambda w: (bool(w["name"]), w["w"] * w["h"]))
     desk = [w for w in wins if "Wine Desktop" in w["name"]]
     if desk:
         return max(desk, key=lambda w: w["w"] * w["h"])
-    wine = [w for w in wins if "explorer.exe" in w["cls"]]
+    wine = [w for w in wins if "explorer.exe" in w["cls"] and w["w"] >= MIN_W]
     return max(wine, key=lambda w: w["w"] * w["h"]) if wine else None
 
 
@@ -96,11 +104,31 @@ def main():
     #    swallows every click.
     atom_state = xlib.XInternAtom(ctypes.c_void_p(dpy), b"_NET_WM_STATE", False)
     atom_above = xlib.XInternAtom(ctypes.c_void_p(dpy), b"_NET_WM_STATE_ABOVE", False)
-    atom_full = xlib.XInternAtom(ctypes.c_void_p(dpy), b"_NET_WM_STATE_FULLSCREEN", False)
-    states = (ctypes.c_ulong * 2)(atom_above, atom_full)
-    xlib.XChangeProperty(ctypes.c_void_p(dpy), ctypes.c_ulong(wid), ctypes.c_ulong(atom_state),
-                         ctypes.c_ulong(4), 32, 0,                     # XA_ATOM, replace
-                         states, 2)
+    # EWMH wants a client message (action=1 ADD), not a property write: mutter
+    # owns _NET_WM_STATE and rewrites it, dropping atoms set behind its back.
+    class _CM(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                    ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                    ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                    ("format", ctypes.c_int), ("data", ctypes.c_long * 5)]
+
+    class _EV(ctypes.Union):
+        _fields_ = [("xclient", _CM), ("pad", ctypes.c_long * 24)]
+
+    msg = _EV()
+    msg.xclient.type = ClientMessage
+    msg.xclient.send_event = 1
+    msg.xclient.display = ctypes.c_void_p(dpy)
+    msg.xclient.window = wid
+    msg.xclient.message_type = atom_state
+    msg.xclient.format = 32
+    msg.xclient.data[0] = 1        # _NET_WM_STATE_ADD
+    msg.xclient.data[1] = atom_above
+    msg.xclient.data[2] = 0
+    msg.xclient.data[3] = 1        # source: application
+    xlib.XSendEvent(ctypes.c_void_p(dpy), ctypes.c_ulong(root), False,
+                    ctypes.c_long(SubstructureRedirectMask | SubstructureNotifyMask),
+                    ctypes.byref(msg))
     xlib.XRaiseWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(wid))
 
     # 2. ask the window manager to activate it: some window managers only
