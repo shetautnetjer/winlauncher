@@ -4,7 +4,7 @@ Find the yellow "Yes" button by colour, click it, and report whether the screen
 changed. Static screens (age gates, menus) make this decisive: a control capture
 right before the click establishes the noise floor.
 
-  python3 clickprobe.py /home/aya-hmw/Pictures/Screenshot.png
+  python3 clickprobe.py ~/Pictures/Screenshot.png
 """
 import ctypes
 import os
@@ -14,7 +14,7 @@ import time
 
 from PIL import Image, ImageChops
 
-SHOT = "/home/aya-hmw/Pictures/Screenshot.png"
+SHOT = os.path.expanduser("~/Pictures/Screenshot.png")
 
 
 def capture(path, tries=3):

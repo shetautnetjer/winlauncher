@@ -70,12 +70,11 @@ UI never gets its first click.
 Fix: upstream Wine implemented this in 11.3 (Feb 2026). A portable Wine 11.22
 staging build lives in ~/aya/tools/wine-portable and is selected per game with
 `WL_WINE=` in `~/.config/winlauncher/games/<id>.conf`; `find_wineserver` follows
-`WL_WINE` so a 11.x client never pairs with a 10.x server. Verified on Femboy
-Futa House: the failure line disappears from the log and clicks work.
+`WL_WINE` so a 11.x client never pairs with a 10.x server. Verified on a Unity 6000.2 title here: the failure line disappears from the
+log and clicks work.
 
-Five titles in this library are Unity 6 and are configured this way:
-MASSAGE MY EX-BULLY, Femboy Futa House, Sex Education Trainer,
-Roommate Life with your Cute Former Labmate, GyakuTobatsu.
+Five titles in this library are Unity 6 and are configured this way; the list
+is kept in the private lab repo, not here.
 
 Not a click-capture problem: `WL_MOUSE_WARP=disable` (added earlier) is kept for
 games that hold a relative-mouse grab, but it does not fix Unity 6 tiles - the

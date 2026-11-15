@@ -7,7 +7,7 @@ active window, so keystrokes (WASD, arrows) go to whatever else is focused and
 the game looks unresponsive to input.
 
   wl-focus                 # focus the "Wine Desktop" window if there is one
-  wl-focus risohiki        # focus the window whose class/title matches
+  wl-focus mygame          # focus the window whose class/title matches
   wl-focus 0x3600003       # focus an explicit window id
 
 Uses X11 directly (XRaiseWindow + _NET_ACTIVE_WINDOW + XSetInputFocus), so it

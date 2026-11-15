@@ -31,7 +31,7 @@ while IFS=$'\t' read -r n id folder exe; do
   info=$("$W" --info "$gexe" 2>&1)
   arch=$(printf '%s\n' "$info" | awk '/^arch/{print $2}')
   eng=$(python3 - "$gexe" <<'PY' 2>/dev/null
-import sys; sys.path.insert(0, "/home/aya-hmw/tools/winlauncher/lib")
+import os, sys; sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from pathlib import Path
 from wlcommon import detect_engine
 d = detect_engine(Path(sys.argv[1])); print(f"{d['engine']}")
